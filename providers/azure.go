@@ -22,9 +22,10 @@ import (
 // AzureProvider represents an Azure based Identity Provider
 type AzureProvider struct {
 	*ProviderData
-	Tenant          string
-	GraphGroupField string
-	isV2Endpoint    bool
+	Tenant            string
+	GraphGroupField   string
+	SkipQueryGraphApi bool
+	isV2Endpoint      bool
 }
 
 var _ Provider = (*AzureProvider)(nil)
@@ -96,7 +97,7 @@ func NewAzureProvider(p *ProviderData, opts options.AzureOptions) *AzureProvider
 			p.Scope = strings.ReplaceAll(p.Scope, " groups", "")
 		}
 
-		if !strings.Contains(p.Scope, " "+azureV2Scope) {
+		if !strings.Contains(p.Scope, " "+azureV2Scope) && !opts.SkipQueryGraphApi {
 			// In order to be able to query MS Graph we must pass the ms graph default endpoint
 			p.Scope += " " + azureV2Scope
 		}
@@ -107,10 +108,11 @@ func NewAzureProvider(p *ProviderData, opts options.AzureOptions) *AzureProvider
 	}
 
 	return &AzureProvider{
-		ProviderData:    p,
-		Tenant:          tenant,
-		GraphGroupField: graphGroupField,
-		isV2Endpoint:    isV2Endpoint,
+		ProviderData:      p,
+		Tenant:            tenant,
+		GraphGroupField:   graphGroupField,
+		isV2Endpoint:      isV2Endpoint,
+		SkipQueryGraphApi: opts.SkipQueryGraphApi,
 	}
 }
 
@@ -164,11 +166,22 @@ func (p *AzureProvider) Redeem(ctx context.Context, redirectURL, code, codeVerif
 		IDToken      string `json:"id_token"`
 	}
 
+	headers := make(http.Header)
+	headers.Add("Content-Type", "application/x-www-form-urlencoded")
+
+	if codeVerifier != "" { // for applications registered as type 'spa', Entra expects the Origin header to be set (https://learn.microsoft.com/en-us/entra/identity-platform/v2-oauth2-auth-code-flow#redirect-uri-setup-required-for-single-page-apps)
+		origin, err := getOriginFromRedirectUrl(redirectURL)
+		if err != nil {
+			return nil, err
+		}
+		headers.Add("Origin", origin)
+	}
+
 	err = requests.New(p.RedeemURL.String()).
 		WithContext(ctx).
 		WithMethod("POST").
 		WithBody(bytes.NewBufferString(params.Encode())).
-		SetHeader("Content-Type", "application/x-www-form-urlencoded").
+		WithHeaders(headers).
 		Do().
 		UnmarshalInto(&jsonResponse)
 	if err != nil {
@@ -192,6 +205,16 @@ func (p *AzureProvider) Redeem(ctx context.Context, redirectURL, code, codeVerif
 	return session, nil
 }
 
+func getOriginFromRedirectUrl(redirectURL string) (string, error) {
+	u, err := url.Parse(redirectURL)
+	if err != nil {
+		fmt.Println("Error getting Origin url from redirectURL:", err)
+		return "", err
+	}
+
+	return u.Scheme + "://" + u.Host, nil
+}
+
 // EnrichSession enriches the session state with userID, mail and groups
 func (p *AzureProvider) EnrichSession(ctx context.Context, session *sessions.SessionState) error {
 	err := p.extractClaimsIntoSession(ctx, session)
@@ -200,7 +223,10 @@ func (p *AzureProvider) EnrichSession(ctx context.Context, session *sessions.Ses
 		logger.Printf("unable to get email and/or groups claims from token: %v", err)
 	}
 
-	if session.Email == "" {
+	if session.Email == "" { 
+		if p.SkipQueryGraphApi {
+			return fmt.Errorf("config set to skip querying of Graph API, but no valid Email available")
+		}
 		email, err := p.getEmailFromProfileAPI(ctx, session.AccessToken)
 		if err != nil {
 			return fmt.Errorf("unable to get email address from profile URL: %v", err)
@@ -209,7 +235,7 @@ func (p *AzureProvider) EnrichSession(ctx context.Context, session *sessions.Ses
 	}
 
 	// If using the v2.0 oidc endpoint we're also querying Microsoft Graph
-	if p.isV2Endpoint {
+	if p.isV2Endpoint && !p.SkipQueryGraphApi {
 		groups, err := p.getGroupsFromProfileAPI(ctx, session)
 		if err != nil {
 			return fmt.Errorf("unable to get groups from Microsoft Graph: %v", err)
@@ -224,14 +250,17 @@ func (p *AzureProvider) prepareRedeem(redirectURL, code, codeVerifier string) (u
 	if code == "" {
 		return params, ErrMissingCode
 	}
-	clientSecret, err := p.GetClientSecret()
-	if err != nil {
-		return params, err
+
+	if codeVerifier == "" {
+		clientSecret, err := p.GetClientSecret()
+		if err != nil {
+			return params, err
+		}
+		params.Add("client_secret", clientSecret)
 	}
 
 	params.Add("redirect_uri", redirectURL)
 	params.Add("client_id", p.ClientID)
-	params.Add("client_secret", clientSecret)
 	params.Add("code", code)
 	params.Add("grant_type", "authorization_code")
 	if codeVerifier != "" {

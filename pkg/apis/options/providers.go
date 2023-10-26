@@ -147,6 +147,9 @@ type AzureOptions struct {
 	// GraphGroupField configures the group field to be used when building the groups list from Microsoft Graph
 	// Default value is 'id'
 	GraphGroupField string `json:"graphGroupField,omitempty"`
+	// Skip querying the MS Graph API for retrieval of groups
+	// Default value is 'false'
+	SkipQueryGraphApi bool `json:"skipQueryGraphApi,omitempty"`
 }
 
 type ADFSOptions struct {
